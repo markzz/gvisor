@@ -260,268 +260,303 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
-func TestVerify(t *testing.T) {
-	// The input data has size dataSize. The portion to be verified ranges from
-	// verifyStart with verifySize. A bit is flipped in outOfRangeByteIndex to
-	// confirm that modifications outside the verification range does not cause
-	// issue. And a bit is flipped in modifyByte to confirm that
-	// modifications in the verification range is caught during verification.
+// prepareVerify generates test data and corresponding Merkle tree, flips a
+// specified bit in the data, and returns the prepared VerifyParams.
+// The test data has size dataSize. The data is hashed with hashAlgorithms. The
+// portion to be verified ranges from verifyStart with verifySize. A bit is
+// flipped in modifyByte to test Verify behavior.
+func prepareVerify(dataSize int64, hashAlgorithms int, dataAndTreeInSameFile bool, modifyByte int64, verifyStart int64, verifySize int64, out io.Writer) ([]byte, VerifyParams, error) {
+	data := make([]byte, dataSize)
+	// Generate random bytes in data.
+	rand.Read(data)
+
+	var tree bytesReadWriter
+	genParams := GenerateParams{
+		Size:                  int64(len(data)),
+		Name:                  defaultName,
+		Mode:                  defaultMode,
+		UID:                   defaultUID,
+		GID:                   defaultGID,
+		HashAlgorithms:        hashAlgorithms,
+		TreeReader:            &tree,
+		TreeWriter:            &tree,
+		DataAndTreeInSameFile: dataAndTreeInSameFile,
+	}
+	if dataAndTreeInSameFile {
+		tree.Write(data)
+		genParams.File = &tree
+	} else {
+		genParams.File = &bytesReadWriter{
+			bytes: data,
+		}
+	}
+	hash, err := Generate(&genParams)
+	if err != nil {
+		return nil, VerifyParams{}, err
+	}
+
+	// Flip a bit in data and checks Verify results.
+	data[modifyByte] ^= 1
+	return data, VerifyParams{
+		Out:                   out,
+		File:                  bytes.NewReader(data),
+		Tree:                  &tree,
+		Size:                  dataSize,
+		Name:                  defaultName,
+		Mode:                  defaultMode,
+		UID:                   defaultUID,
+		GID:                   defaultGID,
+		HashAlgorithms:        hashAlgorithms,
+		ReadOffset:            verifyStart,
+		ReadSize:              verifySize,
+		Expected:              hash,
+		DataAndTreeInSameFile: dataAndTreeInSameFile,
+	}, nil
+}
+
+func TestVerifyInvalidRange(t *testing.T) {
 	testCases := []struct {
-		dataSize    int64
 		verifyStart int64
 		verifySize  int64
-		// A byte in input data is modified during the test. If the
-		// modified byte falls in verification range, Verify should
-		// fail, otherwise Verify should still succeed.
-		modifyByte    int64
-		modifyName    bool
-		modifySize    bool
-		modifyMode    bool
-		modifyUID     bool
-		modifyGID     bool
-		shouldSucceed bool
 	}{
-		// Verify range start outside the data range should fail.
+		// Verify range start outside data range.
 		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   usermem.PageSize,
-			verifySize:    1,
-			modifyByte:    0,
-			shouldSucceed: false,
+			verifyStart: usermem.PageSize,
+			verifySize:  1,
 		},
-		// Verifying range is valid if it starts inside data and ends
-		// outside data range, in that case start to the end of data is
-		// verified.
+		// Verify range ends outside data range.
 		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    0,
-			shouldSucceed: false,
+			verifyStart: 0,
+			verifySize:  2 * usermem.PageSize,
 		},
-		// Invalid verify range (negative size) should fail.
+		// Verify range with negative size.
 		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   1,
-			verifySize:    -1,
-			modifyByte:    0,
-			shouldSucceed: false,
+			verifyStart: 1,
+			verifySize:  -1,
 		},
-		// 0 verify size should only verify metadata.
+	}
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("start:%d, size:%d", tc.verifyStart, tc.verifySize), func(t *testing.T) {
+			for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+				for _, dataAndTreeInSameFile := range []bool{false, true} {
+					var buf bytes.Buffer
+					_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, tc.verifyStart, tc.verifySize, &buf)
+					if err != nil {
+						t.Fatalf("prepareVerify: %v", err)
+					}
+					if _, err := Verify(&params); err == nil {
+						t.Errorf("Verification succeeded when expected to fail")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyUnmodifiedMetadata(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			if _, err := Verify(&params); err != nil && err != io.EOF {
+				t.Errorf("Verification failed when expected to succeed: %v", err)
+			}
+		}
+	}
+}
+
+func TestVerifyModifiedName(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			params.Name += "abc"
+			if _, err := Verify(&params); err == nil {
+				t.Errorf("Verification succeeded when expected to fail")
+			}
+		}
+	}
+}
+
+func TestVerifyModifiedSize(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			params.Size--
+			if _, err := Verify(&params); err == nil {
+				t.Errorf("Verification succeeded when expected to fail")
+			}
+		}
+	}
+}
+
+func TestVerifyModifiedMode(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			params.Mode++
+			if _, err := Verify(&params); err == nil {
+				t.Errorf("Verification succeeded when expected to fail")
+			}
+		}
+	}
+}
+
+func TestVerifyModifiedUID(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			params.UID++
+			if _, err := Verify(&params); err == nil {
+				t.Errorf("Verification succeeded when expected to fail")
+			}
+		}
+	}
+}
+
+func TestVerifyModifiedGID(t *testing.T) {
+	for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+		for _, dataAndTreeInSameFile := range []bool{false, true} {
+			var buf bytes.Buffer
+			_, params, err := prepareVerify(usermem.PageSize /* dataSize */, hashAlgorithms, dataAndTreeInSameFile, 0 /* modifyByte */, 0 /* verifyStart */, 0 /* verifySize */, &buf)
+			if err != nil {
+				t.Fatalf("prepareVerify: %v", err)
+			}
+			params.GID++
+			if _, err := Verify(&params); err == nil {
+				t.Errorf("Verification succeeded when expected to fail")
+			}
+		}
+	}
+}
+
+func TestModifyOutsideVerifyRange(t *testing.T) {
+	testCases := []struct {
+		modifyByte int64
+	}{
 		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			shouldSucceed: true,
+			modifyByte: 4*usermem.PageSize - 1,
 		},
-		// Modified name should fail verification.
 		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			modifyName:    true,
-			shouldSucceed: false,
+			modifyByte: 5 * usermem.PageSize,
 		},
-		// Modified size should fail verification.
-		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			modifySize:    true,
-			shouldSucceed: false,
-		},
-		// Modified mode should fail verification.
-		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			modifyMode:    true,
-			shouldSucceed: false,
-		},
-		// Modified UID should fail verification.
-		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			modifyUID:     true,
-			shouldSucceed: false,
-		},
-		// Modified GID should fail verification.
-		{
-			dataSize:      usermem.PageSize,
-			verifyStart:   0,
-			verifySize:    0,
-			modifyByte:    0,
-			modifyGID:     true,
-			shouldSucceed: false,
-		},
-		// The test cases below use a block-aligned verify range.
+	}
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("modifyByte:%d", tc.modifyByte), func(t *testing.T) {
+			for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
+				for _, dataAndTreeInSameFile := range []bool{false, true} {
+					dataSize := int64(8 * usermem.PageSize)
+					verifyStart := int64(4 * usermem.PageSize)
+					verifySize := int64(usermem.PageSize)
+					var buf bytes.Buffer
+					// Modified byte is outside verify
+					// range. Verify should succeed.
+					data, params, err := prepareVerify(dataSize, hashAlgorithms, dataAndTreeInSameFile, tc.modifyByte, verifyStart, verifySize, &buf)
+					if err != nil {
+						t.Fatalf("prepareVerify: %v", err)
+					}
+					n, err := Verify(&params)
+					if err != nil && err != io.EOF {
+						t.Errorf("Verification failed when expected to succeed: %v", err)
+					}
+					if n != verifySize {
+						t.Errorf("Got Verify output size %d, want %d", n, verifySize)
+					}
+					if int64(buf.Len()) != verifySize {
+						t.Errorf("Got Verify output buf size %d, want %d,", buf.Len(), verifySize)
+					}
+					if !bytes.Equal(data[verifyStart:verifyStart+verifySize], buf.Bytes()) {
+						t.Errorf("Incorrect output buf from Verify")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestModifyInsideVerifyRange(t *testing.T) {
+	testCases := []struct {
+		verifyStart int64
+		verifySize  int64
+		modifyByte  int64
+	}{
+		// Test a block-aligned verify range.
 		// Modifying a byte in the verified range should cause verify
 		// to fail.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4 * usermem.PageSize,
-			verifySize:    usermem.PageSize,
-			modifyByte:    4 * usermem.PageSize,
-			shouldSucceed: false,
-		},
-		// Modifying a byte before the verified range should not cause
-		// verify to fail.
-		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4 * usermem.PageSize,
-			verifySize:    usermem.PageSize,
-			modifyByte:    4*usermem.PageSize - 1,
-			shouldSucceed: true,
-		},
-		// Modifying a byte after the verified range should not cause
-		// verify to fail.
-		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4 * usermem.PageSize,
-			verifySize:    usermem.PageSize,
-			modifyByte:    5 * usermem.PageSize,
-			shouldSucceed: true,
+			verifyStart: 4 * usermem.PageSize,
+			verifySize:  usermem.PageSize,
+			modifyByte:  4 * usermem.PageSize,
 		},
 		// The tests below use a non-block-aligned verify range.
 		// Modifying a byte at strat of verify range should cause
 		// verify to fail.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4*usermem.PageSize + 123,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    4*usermem.PageSize + 123,
-			shouldSucceed: false,
+			verifyStart: 4*usermem.PageSize + 123,
+			verifySize:  2 * usermem.PageSize,
+			modifyByte:  4*usermem.PageSize + 123,
 		},
 		// Modifying a byte at the end of verify range should cause
 		// verify to fail.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4*usermem.PageSize + 123,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    6*usermem.PageSize + 123,
-			shouldSucceed: false,
+			verifyStart: 4*usermem.PageSize + 123,
+			verifySize:  2 * usermem.PageSize,
+			modifyByte:  6*usermem.PageSize + 123,
 		},
 		// Modifying a byte in the middle verified block should cause
 		// verify to fail.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4*usermem.PageSize + 123,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    5*usermem.PageSize + 123,
-			shouldSucceed: false,
+			verifyStart: 4*usermem.PageSize + 123,
+			verifySize:  2 * usermem.PageSize,
+			modifyByte:  5*usermem.PageSize + 123,
 		},
 		// Modifying a byte in the first block in the verified range
 		// should cause verify to fail, even the modified bit itself is
 		// out of verify range.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4*usermem.PageSize + 123,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    4*usermem.PageSize + 122,
-			shouldSucceed: false,
+			verifyStart: 4*usermem.PageSize + 123,
+			verifySize:  2 * usermem.PageSize,
+			modifyByte:  4*usermem.PageSize + 122,
 		},
 		// Modifying a byte in the last block in the verified range
 		// should cause verify to fail, even the modified bit itself is
 		// out of verify range.
 		{
-			dataSize:      8 * usermem.PageSize,
-			verifyStart:   4*usermem.PageSize + 123,
-			verifySize:    2 * usermem.PageSize,
-			modifyByte:    6*usermem.PageSize + 124,
-			shouldSucceed: false,
+			verifyStart: 4*usermem.PageSize + 123,
+			verifySize:  2 * usermem.PageSize,
+			modifyByte:  6*usermem.PageSize + 124,
 		},
 	}
-
 	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("%d", tc.modifyByte), func(t *testing.T) {
-			data := make([]byte, tc.dataSize)
-			// Generate random bytes in data.
-			rand.Read(data)
-
+		t.Run(fmt.Sprintf("modifyByte:%d, verifyStart:%d, verifySize:%d", tc.modifyByte, tc.verifyStart, tc.verifySize), func(t *testing.T) {
 			for _, hashAlgorithms := range []int{linux.FS_VERITY_HASH_ALG_SHA256, linux.FS_VERITY_HASH_ALG_SHA512} {
 				for _, dataAndTreeInSameFile := range []bool{false, true} {
-					var tree bytesReadWriter
-					genParams := GenerateParams{
-						Size:                  int64(len(data)),
-						Name:                  defaultName,
-						Mode:                  defaultMode,
-						UID:                   defaultUID,
-						GID:                   defaultGID,
-						HashAlgorithms:        hashAlgorithms,
-						TreeReader:            &tree,
-						TreeWriter:            &tree,
-						DataAndTreeInSameFile: dataAndTreeInSameFile,
-					}
-					if dataAndTreeInSameFile {
-						tree.Write(data)
-						genParams.File = &tree
-					} else {
-						genParams.File = &bytesReadWriter{
-							bytes: data,
-						}
-					}
-					hash, err := Generate(&genParams)
-					if err != nil {
-						t.Fatalf("Generate failed: %v", err)
-					}
-
-					// Flip a bit in data and checks Verify results.
+					dataSize := int64(8 * usermem.PageSize)
 					var buf bytes.Buffer
-					data[tc.modifyByte] ^= 1
-					verifyParams := VerifyParams{
-						Out:                   &buf,
-						File:                  bytes.NewReader(data),
-						Tree:                  &tree,
-						Size:                  tc.dataSize,
-						Name:                  defaultName,
-						Mode:                  defaultMode,
-						UID:                   defaultUID,
-						GID:                   defaultGID,
-						HashAlgorithms:        hashAlgorithms,
-						ReadOffset:            tc.verifyStart,
-						ReadSize:              tc.verifySize,
-						Expected:              hash,
-						DataAndTreeInSameFile: dataAndTreeInSameFile,
+					_, params, err := prepareVerify(dataSize, hashAlgorithms, dataAndTreeInSameFile, tc.modifyByte, tc.verifyStart, tc.verifySize, &buf)
+					if err != nil {
+						t.Fatalf("prepareVerify: %v", err)
 					}
-					if tc.modifyName {
-						verifyParams.Name = defaultName + "abc"
-					}
-					if tc.modifySize {
-						verifyParams.Size--
-					}
-					if tc.modifyMode {
-						verifyParams.Mode = defaultMode + 1
-					}
-					if tc.modifyUID {
-						verifyParams.UID = defaultUID + 1
-					}
-					if tc.modifyGID {
-						verifyParams.GID = defaultGID + 1
-					}
-					if tc.shouldSucceed {
-						n, err := Verify(&verifyParams)
-						if err != nil && err != io.EOF {
-							t.Errorf("Verification failed when expected to succeed: %v", err)
-						}
-						if n != tc.verifySize {
-							t.Errorf("Got Verify output size %d, want %d", n, tc.verifySize)
-						}
-						if int64(buf.Len()) != tc.verifySize {
-							t.Errorf("Got Verify output buf size %d, want %d,", buf.Len(), tc.verifySize)
-						}
-						if !bytes.Equal(data[tc.verifyStart:tc.verifyStart+tc.verifySize], buf.Bytes()) {
-							t.Errorf("Incorrect output buf from Verify")
-						}
-					} else {
-						if _, err := Verify(&verifyParams); err == nil {
-							t.Errorf("Verification succeeded when expected to fail")
-						}
+					if _, err := Verify(&params); err == nil {
+						t.Errorf("Verification succeeded when expected to fail")
 					}
 				}
 			}
