@@ -286,6 +286,7 @@ type IPv4 struct {
 	Checksum       *uint16
 	SrcAddr        *tcpip.Address
 	DstAddr        *tcpip.Address
+	Options        *header.IPv4Options
 }
 
 func (l *IPv4) String() string {
@@ -294,10 +295,23 @@ func (l *IPv4) String() string {
 
 // ToBytes implements Layer.ToBytes.
 func (l *IPv4) ToBytes() ([]byte, error) {
-	b := make([]byte, header.IPv4MinimumSize)
+	// An IPv4 header is variable length depending on the size of the Options.
+	hdrLen := header.IPv4MinimumSize
+	if l.Options != nil {
+		hdrLen += header.RoundUp4(len(*l.Options))
+		if hdrLen > header.IPv4MaximumHeaderSize {
+			// While we know we are in a test we don't have that context. Panic.
+			// While ToBytes can be called on packets that were received as well
+			// as packets locally generated, it is physically impossible for a
+			// received packet to overflow this value so any such failure must
+			// be the result of a local programming error and not remotely
+			// triggered. A panic is therefore appropriate.
+			panic(fmt.Sprintf("IPv4 Options %d bytes, Max %d", len(*l.Options), header.IPv4MaximumOptionsSize))
+		}
+	}
+	b := make([]byte, hdrLen)
 	h := header.IPv4(b)
 	fields := &header.IPv4Fields{
-		IHL:            20,
 		TOS:            0,
 		TotalLength:    0,
 		ID:             0,
@@ -308,6 +322,11 @@ func (l *IPv4) ToBytes() ([]byte, error) {
 		Checksum:       0,
 		SrcAddr:        tcpip.Address(""),
 		DstAddr:        tcpip.Address(""),
+		Options:        nil,
+	}
+	// Leave an empty options slice as nil.
+	if hdrLen > header.IPv4MinimumSize {
+		fields.Options = *l.Options
 	}
 	if l.TOS != nil {
 		fields.TOS = *l.TOS
@@ -362,6 +381,11 @@ func (l *IPv4) ToBytes() ([]byte, error) {
 	if l.Checksum == nil {
 		h.SetChecksum(^h.CalculateChecksum())
 	}
+	// Encode can not set this incorrectly so we need to overwrite what it wrote
+	// in order to test handling of a bad IHL value..
+	if l.IHL != nil {
+		h.SetHeaderLength(*l.IHL)
+	}
 	return h, nil
 }
 
@@ -387,6 +411,13 @@ func Address(v tcpip.Address) *tcpip.Address {
 // continues parsing further encapsulations.
 func parseIPv4(b []byte) (Layer, layerParser) {
 	h := header.IPv4(b)
+	hdrLen := h.HeaderLength()
+	// Even if there are no options, we set an empty options field so that the
+	// decision to compare is up to the caller of that comparison.
+	var options header.IPv4Options = nil
+	if hdrLen > header.IPv4MinimumSize {
+		options = append(options, h.Options()...)
+	}
 	tos, _ := h.TOS()
 	ipv4 := IPv4{
 		IHL:            Uint8(h.HeaderLength()),
@@ -400,8 +431,13 @@ func parseIPv4(b []byte) (Layer, layerParser) {
 		Checksum:       Uint16(h.Checksum()),
 		SrcAddr:        Address(h.SourceAddress()),
 		DstAddr:        Address(h.DestinationAddress()),
+		Options:        &options,
 	}
 	var nextParser layerParser
+	// If it is a fragment, don't treat it as having a transport protocol.
+	if h.FragmentOffset() != 0 || h.More() {
+		return &ipv4, parsePayload
+	}
 	switch h.TransportProtocol() {
 	case header.TCPProtocolNumber:
 		nextParser = parseTCP
@@ -709,12 +745,17 @@ func parseIPv6FragmentExtHdr(b []byte) (Layer, layerParser) {
 	nextHeader := b[0]
 	var extHdr header.IPv6FragmentExtHdr
 	copy(extHdr[:], b[2:])
-	return &IPv6FragmentExtHdr{
+	fragLayer := IPv6FragmentExtHdr{
 		NextHeader:     IPv6ExtHdrIdent(header.IPv6ExtensionHeaderIdentifier(nextHeader)),
 		FragmentOffset: Uint16(extHdr.FragmentOffset()),
 		MoreFragments:  Bool(extHdr.More()),
 		Identification: Uint32(extHdr.ID()),
-	}, nextIPv6PayloadParser(nextHeader)
+	}
+	// If it is a fragment, we can't interpret it.
+	if extHdr.FragmentOffset() != 0 || extHdr.More() {
+		return &fragLayer, parsePayload
+	}
+	return &fragLayer, nextIPv6PayloadParser(nextHeader)
 }
 
 func (l *IPv6HopByHopOptionsExtHdr) length() int {
@@ -861,6 +902,22 @@ func (l *ICMPv6) merge(other Layer) error {
 	return mergeLayer(l, other)
 }
 
+// ICMPv4 can construct and match an ICMPv4 encapsulation.
+type ICMPv4 struct {
+	LayerBase
+	Type     *header.ICMPv4Type
+	Code     *header.ICMPv4Code
+	Checksum *uint16
+	Ident    *uint16 // Only in Echo Request/Reply.
+	Sequence *uint16 // Only in Echo Request/Reply.
+	Pointer  *uint8  // Only in Parameter Problem.
+	Payload  []byte
+}
+
+func (l *ICMPv4) String() string {
+	return stringLayer(l)
+}
+
 // ICMPv4Type is a helper routine that allocates a new header.ICMPv4Type value
 // to store t and returns a pointer to it.
 func ICMPv4Type(t header.ICMPv4Type) *header.ICMPv4Type {
@@ -871,21 +928,6 @@ func ICMPv4Type(t header.ICMPv4Type) *header.ICMPv4Type {
 // to store t and returns a pointer to it.
 func ICMPv4Code(t header.ICMPv4Code) *header.ICMPv4Code {
 	return &t
-}
-
-// ICMPv4 can construct and match an ICMPv4 encapsulation.
-type ICMPv4 struct {
-	LayerBase
-	Type     *header.ICMPv4Type
-	Code     *header.ICMPv4Code
-	Checksum *uint16
-	Ident    *uint16
-	Sequence *uint16
-	Payload  []byte
-}
-
-func (l *ICMPv4) String() string {
-	return stringLayer(l)
 }
 
 // ToBytes implements Layer.ToBytes.
@@ -901,11 +943,19 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 	if copied := copy(h.Payload(), l.Payload); copied != len(l.Payload) {
 		panic(fmt.Sprintf("wrong number of bytes copied into h.Payload(): got = %d, want = %d", len(h.Payload()), len(l.Payload)))
 	}
-	if l.Ident != nil {
-		h.SetIdent(*l.Ident)
-	}
-	if l.Sequence != nil {
-		h.SetSequence(*l.Sequence)
+	typ := h.Type()
+	switch typ {
+	case header.ICMPv4EchoReply, header.ICMPv4Echo:
+		if l.Ident != nil {
+			h.SetIdent(*l.Ident)
+		}
+		if l.Sequence != nil {
+			h.SetSequence(*l.Sequence)
+		}
+	case header.ICMPv4ParamProblem:
+		if l.Pointer != nil {
+			h.SetPointer(*l.Pointer)
+		}
 	}
 
 	// The checksum must be handled last because the ICMPv4 header fields are
@@ -932,13 +982,20 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 // parser for the encapsulated payload.
 func parseICMPv4(b []byte) (Layer, layerParser) {
 	h := header.ICMPv4(b)
+
+	typ := h.Type()
 	icmpv4 := ICMPv4{
-		Type:     ICMPv4Type(h.Type()),
+		Type:     ICMPv4Type(typ),
 		Code:     ICMPv4Code(h.Code()),
 		Checksum: Uint16(h.Checksum()),
-		Ident:    Uint16(h.Ident()),
-		Sequence: Uint16(h.Sequence()),
 		Payload:  h.Payload(),
+	}
+	switch typ {
+	case header.ICMPv4EchoReply, header.ICMPv4Echo:
+		icmpv4.Ident = Uint16(h.Ident())
+		icmpv4.Sequence = Uint16(h.Sequence())
+	case header.ICMPv4ParamProblem:
+		icmpv4.Pointer = Uint8(h.Pointer())
 	}
 	return &icmpv4, nil
 }

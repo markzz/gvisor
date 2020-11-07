@@ -603,7 +603,7 @@ func TestIPv4Sanity(t *testing.T) {
 			// says: "Internet Header Length is the length of the internet header
 			// in 32 bit words..." and on page 23: "The internet header padding is
 			// used to ensure that the internet header ends on a 32 bit boundary."
-			ipHeaderLength := ((header.IPv4MinimumSize + len(test.options)) + header.IPv4IHLStride - 1) & ^(header.IPv4IHLStride - 1)
+			ipHeaderLength := header.RoundUp4(header.IPv4MinimumSize + len(test.options))
 
 			if ipHeaderLength > header.IPv4MaximumHeaderSize {
 				t.Fatalf("too many bytes in options: got = %d, want <= %d ", ipHeaderLength, header.IPv4MaximumHeaderSize)
@@ -624,17 +624,13 @@ func TestIPv4Sanity(t *testing.T) {
 				totalLen = test.maxTotalLength
 			}
 			ip.Encode(&header.IPv4Fields{
-				IHL:         uint8(ipHeaderLength),
 				TotalLength: totalLen,
 				Protocol:    test.transportProtocol,
 				TTL:         test.TTL,
 				SrcAddr:     remoteIPv4Addr,
 				DstAddr:     ipv4Addr.Address,
+				Options:     test.options,
 			})
-			if n := copy(ip.Options(), test.options); n != len(test.options) {
-				t.Fatalf("options larger than available space: copied %d/%d bytes", n, len(test.options))
-			}
-			// Override the correct value if the test case specified one.
 			if test.headerLength != 0 {
 				ip.SetHeaderLength(test.headerLength)
 			}
@@ -1160,9 +1156,11 @@ func TestInvalidFragments(t *testing.T) {
 	}
 
 	type fragmentData struct {
-		ipv4fields   header.IPv4Fields
+		ipv4fields header.IPv4Fields
+		//  0 means calculate correct IHL. Non 0 means override the correct IHL.
+		overrideIHL  int // For 0 use 1 as it is an int divided by 4. (1 / 4 = 0)
 		payload      []byte
-		autoChecksum bool // if true, the Checksum field will be overwritten.
+		autoChecksum bool // If true, the Checksum field will be overwritten.
 	}
 
 	tests := []struct {
@@ -1176,7 +1174,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            0,
 						TOS:            tos,
 						TotalLength:    0,
 						ID:             ident,
@@ -1187,6 +1184,7 @@ func TestInvalidFragments(t *testing.T) {
 						SrcAddr:        addr1,
 						DstAddr:        addr2,
 					},
+					overrideIHL:  1, // See note above.
 					payload:      payloadGen(12),
 					autoChecksum: true,
 				},
@@ -1199,7 +1197,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            0,
 						TOS:            tos,
 						TotalLength:    0,
 						ID:             ident,
@@ -1210,6 +1207,7 @@ func TestInvalidFragments(t *testing.T) {
 						SrcAddr:        addr1,
 						DstAddr:        addr2,
 					},
+					overrideIHL:  1, // See note above.
 					payload:      payloadGen(12),
 					autoChecksum: true,
 				},
@@ -1224,7 +1222,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 17,
 						ID:             ident,
@@ -1249,7 +1246,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 16,
 						ID:             ident,
@@ -1272,7 +1268,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize - 12,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 28,
 						ID:             ident,
@@ -1284,11 +1279,11 @@ func TestInvalidFragments(t *testing.T) {
 						DstAddr:        addr2,
 					},
 					payload:      payloadGen(28),
+					overrideIHL:  header.IPv4MinimumSize - 12,
 					autoChecksum: true,
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize - 12,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize - 12,
 						ID:             ident,
@@ -1300,6 +1295,7 @@ func TestInvalidFragments(t *testing.T) {
 						DstAddr:        addr2,
 					},
 					payload:      payloadGen(28),
+					overrideIHL:  header.IPv4MinimumSize - 12,
 					autoChecksum: true,
 				},
 			},
@@ -1311,7 +1307,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize + 4,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 28,
 						ID:             ident,
@@ -1323,11 +1318,11 @@ func TestInvalidFragments(t *testing.T) {
 						DstAddr:        addr2,
 					},
 					payload:      payloadGen(28),
+					overrideIHL:  header.IPv4MinimumSize + 4,
 					autoChecksum: true,
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize + 4,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 4,
 						ID:             ident,
@@ -1339,6 +1334,7 @@ func TestInvalidFragments(t *testing.T) {
 						DstAddr:        addr2,
 					},
 					payload:      payloadGen(28),
+					overrideIHL:  header.IPv4MinimumSize + 4,
 					autoChecksum: true,
 				},
 			},
@@ -1350,7 +1346,6 @@ func TestInvalidFragments(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 8,
 						ID:             ident,
@@ -1366,7 +1361,6 @@ func TestInvalidFragments(t *testing.T) {
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 8,
 						ID:             ident,
@@ -1382,7 +1376,6 @@ func TestInvalidFragments(t *testing.T) {
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 8,
 						ID:             ident,
@@ -1423,6 +1416,11 @@ func TestInvalidFragments(t *testing.T) {
 
 				ip := header.IPv4(hdr.Prepend(pktSize))
 				ip.Encode(&f.ipv4fields)
+				// Encode sets this up correctly. If we want a different value for
+				// testing then we need to overwrite the good value.
+				if f.overrideIHL != 0 {
+					ip.SetHeaderLength(uint8(f.overrideIHL))
+				}
 				copy(ip[header.IPv4MinimumSize:], f.payload)
 
 				if f.autoChecksum {
@@ -1474,7 +1472,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 16,
 						ID:             ident,
@@ -1495,7 +1492,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 16,
 						ID:             ident,
@@ -1510,7 +1506,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 16,
 						ID:             ident,
@@ -1531,7 +1526,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    uint16(header.IPv4MinimumSize + len(data) - 16),
 						ID:             ident,
@@ -1552,7 +1546,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 8,
 						ID:             ident,
@@ -1567,7 +1560,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    uint16(header.IPv4MinimumSize + len(data) - 16),
 						ID:             ident,
@@ -1588,7 +1580,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 			fragments: []fragmentData{
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    uint16(header.IPv4MinimumSize + len(data) - 16),
 						ID:             ident,
@@ -1603,7 +1594,6 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 				},
 				{
 					ipv4fields: header.IPv4Fields{
-						IHL:            header.IPv4MinimumSize,
 						TOS:            tos,
 						TotalLength:    header.IPv4MinimumSize + 8,
 						ID:             ident,
@@ -2104,7 +2094,6 @@ func TestReceiveFragments(t *testing.T) {
 				// Serialize IPv4 fixed header.
 				ip := header.IPv4(hdr.Prepend(header.IPv4MinimumSize))
 				ip.Encode(&header.IPv4Fields{
-					IHL:            header.IPv4MinimumSize,
 					TotalLength:    header.IPv4MinimumSize + uint16(len(frag.payload)),
 					ID:             frag.id,
 					Flags:          frag.flags,
@@ -2370,7 +2359,6 @@ func TestPacketQueing(t *testing.T) {
 				u.SetChecksum(^u.CalculateChecksum(sum))
 				ip := header.IPv4(hdr.Prepend(header.IPv4MinimumSize))
 				ip.Encode(&header.IPv4Fields{
-					IHL:         header.IPv4MinimumSize,
 					TotalLength: header.IPv4MinimumSize + header.UDPMinimumSize,
 					TTL:         ipv4.DefaultTTL,
 					Protocol:    uint8(udp.ProtocolNumber),
@@ -2414,7 +2402,6 @@ func TestPacketQueing(t *testing.T) {
 				pkt.SetChecksum(^header.Checksum(pkt, 0))
 				ip := header.IPv4(hdr.Prepend(header.IPv4MinimumSize))
 				ip.Encode(&header.IPv4Fields{
-					IHL:         header.IPv4MinimumSize,
 					TotalLength: uint16(totalLen),
 					Protocol:    uint8(icmp.ProtocolNumber4),
 					TTL:         ipv4.DefaultTTL,
